@@ -10,9 +10,13 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import io
 import math
+import subprocess
 import tempfile
+import threading
 from collections.abc import AsyncIterator, Mapping, Sequence
+from dataclasses import dataclass
 from pathlib import Path
 from typing import cast
 
@@ -54,8 +58,8 @@ def probe_duration(source: Path) -> float:
     will place a clip in samples that are not there.
     """
 
-    info = _probe(source)
-    return _limit_to_readable_video(source, info, _declared_duration(info))
+    info, tallies = _scan_source(source)
+    return _limit_to_readable_video(info, tallies, _declared_duration(info))
 
 
 def render_digest(
@@ -71,27 +75,19 @@ def render_digest(
     truncated source still makes ffmpeg exit 0.
     """
 
-    checked = _require_intervals(intervals)
-    has_audio = _source_has_audio(source)
-
     with tempfile.TemporaryDirectory(prefix="tiktok-digest-") as directory:
-        root = Path(directory)
-        clips: list[Path] = []
-        for index, (start, end) in enumerate(checked):
-            clip = root / f"clip-{index:04d}.mp4"
-            _cut_clip(source, start, end, clip, has_audio=has_audio)
-            clips.append(clip)
+        output = Path(directory) / "digest.mp4"
 
-        output = root / "digest.mp4"
-        _concat(clips, output)
-        # Check while the file still exists. The temp directory deletes it
-        # on the way out, including when this raises, so a short encode is
-        # never what the handler returns.
-        _reject_short_output(output, checked)
-        data = output.read_bytes()
+        async def _encode() -> None:
+            # The page streams this same iterator. A second cutter would
+            # let the download and the tests drift apart.
+            async for _percent in iter_cutting_progress(source, intervals, output):
+                pass
 
-    _require_ftyp(data)
-    return data
+        asyncio.run(_encode())
+        # The directory deletes this file on the way out, including when
+        # the encode raised, so the bytes are read only after 100.
+        return output.read_bytes()
 
 
 async def iter_cutting_progress(
@@ -177,17 +173,17 @@ def _declared_duration(info: Mapping[str, object]) -> float:
 
 
 def _limit_to_readable_video(
-    source: Path,
     info: Mapping[str, object],
+    tallies: Mapping[int, _PacketTally],
     declared: float,
 ) -> float:
     """Cap ``declared`` at the last video packet whose bytes are in the file.
 
     ``ffprobe`` still reports the indexed frame count and the container
-    duration after ``mdat`` is cut in half. The packet list stops at the
-    cut. When that list is shorter than the index, or the index has no
-    frame count and the timeline stops early, the declared duration would
-    let selection ask for samples the encoder cannot produce.
+    duration after ``mdat`` is cut in half. The tally stops at the cut.
+    When that tally is shorter than the index, or the index has no frame
+    count and the timeline stops early, the declared duration would let
+    selection ask for samples the encoder cannot produce.
     """
 
     stream = _longest_video(_streams(info))
@@ -197,21 +193,18 @@ def _limit_to_readable_video(
     if isinstance(index, bool) or not isinstance(index, int):
         return declared
 
-    packets = [
-        packet
-        for packet in _packets(_probe(source, with_packets=True))
-        if packet.get("stream_index") == index
-    ]
+    tally = tallies.get(index)
+    count = 0 if tally is None else tally.count
     indexed = _optional_int(stream.get("nb_frames"))
-    if indexed is not None and indexed > 0 and not packets:
+    if indexed is not None and indexed > 0 and count == 0:
         raise ClipError(
             "The file has no readable video. It needs to be a complete MP4."
         )
-    readable_end = _last_packet_end(packets)
+    readable_end = None if tally is None else tally.end
     if readable_end is None:
         return declared
 
-    samples_missing = indexed is not None and len(packets) < indexed
+    samples_missing = indexed is not None and count < indexed
     # No frame count to compare. A one-frame gap is normal when the
     # container follows a slightly longer audio track; a truncated file
     # stops well before that.
@@ -270,23 +263,190 @@ def _reject_short_output(
     expected = sum(end - start for start, end in intervals)
     stream = _longest_video(_streams(_probe(path)))
     actual = _read_duration(stream) if stream is not None else None
-    if actual is None or expected - actual > 0.5 / OUTPUT_FPS:
-        shown = 0.0 if actual is None else actual
+    # No measured duration is not a zero-length video. Saying 0.000s would
+    # send the client to trim a file the encoder did not finish.
+    if actual is None:
+        raise ClipError("Could not read a duration from the rendered digest.")
+    if expected - actual > 0.5 / OUTPUT_FPS:
         raise ClipError(
             "Source is shorter than the requested digest: "
-            f"the readable video is {shown:.3f}s, {expected:.3f}s requested."
+            f"the readable video is {actual:.3f}s, {expected:.3f}s requested."
         )
 
 
-def _probe(source: Path, *, with_packets: bool = False) -> Mapping[str, object]:
+@dataclass
+class _PacketTally:
+    """Packets still on disk for one stream, and where the last one ends."""
+
+    count: int = 0
+    end: float | None = None
+
+
+def _scan_source(source: Path) -> tuple[dict[str, object], dict[int, _PacketTally]]:
+    """Read format, streams, and packet ends in one ffprobe pass.
+
+    A second probe would demux the file again. The tally keeps a count and
+    a last timestamp per stream. Storing every packet would hold more than
+    the upload. A truncated ``mdat`` makes the demuxer stop, so the tally
+    is the samples still in the file, which the container duration cannot say.
+    """
+
+    command = [
+        "ffprobe",
+        "-v",
+        "error",
+        "-show_format",
+        "-show_streams",
+        "-show_packets",
+        "-show_entries",
+        "format=duration:stream=index,codec_type,nb_frames,duration:"
+        "stream_disposition=attached_pic:packet=stream_index,pts_time,duration_time",
+        "-of",
+        "default",
+        str(source),
+    ]
     try:
-        if with_packets:
-            # Demux only. A truncated mdat makes the demuxer stop; the
-            # packets in the report are the ones still in the file, which
-            # is the comparison the container duration cannot make.
-            info = ffmpeg.probe(str(source), show_packets=None)
-        else:
-            info = ffmpeg.probe(str(source))
+        process = subprocess.Popen(
+            command,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            stdin=subprocess.DEVNULL,
+        )
+    except FileNotFoundError as exc:
+        raise ClipError(
+            "ffprobe is not available, so the source duration cannot be read."
+        ) from exc
+
+    stdout_pipe = process.stdout
+    stderr_pipe = process.stderr
+    assert stdout_pipe is not None
+    assert stderr_pipe is not None
+    stderr_parts: list[bytes] = []
+
+    def _drain_stderr() -> None:
+        stderr_parts.append(stderr_pipe.read())
+
+    # stderr is drained beside stdout. If that pipe fills, ffprobe stops
+    # writing the packet lines and the tally never finishes.
+    drain = threading.Thread(target=_drain_stderr)
+    drain.start()
+    output = io.TextIOWrapper(stdout_pipe, encoding="utf-8", errors="replace")
+    try:
+        info, tallies = _read_ffprobe(output)
+    finally:
+        output.close()
+        code = process.wait()
+        drain.join()
+    if code != 0:
+        message = stderr_parts[0] if stderr_parts else b""
+        raise ClipError(_failure("read the source", message))
+    return info, tallies
+
+
+def _read_ffprobe(
+    lines: io.TextIOBase,
+) -> tuple[dict[str, object], dict[int, _PacketTally]]:
+    streams: list[dict[str, object]] = []
+    format_info: dict[str, object] = {}
+    tallies: dict[int, _PacketTally] = {}
+    section: str | None = None
+    fields: dict[str, str] = {}
+    allowed = {
+        "PACKET": {"stream_index", "pts_time", "duration_time"},
+        "STREAM": {
+            "index",
+            "codec_type",
+            "nb_frames",
+            "duration",
+            "DISPOSITION:attached_pic",
+        },
+        "FORMAT": {"duration"},
+    }
+    for raw in lines:
+        line = raw.strip()
+        if not line:
+            continue
+        if line.startswith("[") and line.endswith("]"):
+            closing = line.startswith("[/")
+            name = line[2:-1] if closing else line[1:-1]
+            if name not in allowed:
+                continue
+            if closing:
+                if section == name:
+                    _finish_section(name, fields, streams, format_info, tallies)
+                section = None
+                fields = {}
+            else:
+                section = name
+                fields = {}
+            continue
+        if section is None or "=" not in line:
+            continue
+        key, value = line.split("=", 1)
+        if key in allowed[section] and key not in fields:
+            fields[key] = value
+    return {"streams": streams, "format": format_info}, tallies
+
+
+def _finish_section(
+    name: str,
+    fields: Mapping[str, str],
+    streams: list[dict[str, object]],
+    format_info: dict[str, object],
+    tallies: dict[int, _PacketTally],
+) -> None:
+    if name == "PACKET":
+        _note_packet(fields, tallies)
+        return
+    if name == "FORMAT":
+        duration = fields.get("duration")
+        if duration is not None:
+            format_info["duration"] = duration
+        return
+    streams.append(_stream_record(fields))
+
+
+def _stream_record(fields: Mapping[str, str]) -> dict[str, object]:
+    stream: dict[str, object] = {}
+    index = _optional_int(fields.get("index"))
+    if index is not None:
+        stream["index"] = index
+    codec = fields.get("codec_type")
+    if codec is not None:
+        stream["codec_type"] = codec
+    if "nb_frames" in fields:
+        stream["nb_frames"] = fields["nb_frames"]
+    if "duration" in fields:
+        stream["duration"] = fields["duration"]
+    flag = fields.get("DISPOSITION:attached_pic")
+    if flag is not None:
+        parsed = _optional_int(flag)
+        stream["disposition"] = {"attached_pic": flag if parsed is None else parsed}
+    return stream
+
+
+def _note_packet(fields: Mapping[str, str], tallies: dict[int, _PacketTally]) -> None:
+    index = _optional_int(fields.get("stream_index"))
+    if index is None:
+        return
+    tally = tallies.get(index)
+    if tally is None:
+        tally = _PacketTally()
+        tallies[index] = tally
+    tally.count += 1
+    pts = _finite_float(fields.get("pts_time"))
+    if pts is None:
+        return
+    duration = _finite_float(fields.get("duration_time"))
+    if duration is not None and duration > 0:
+        pts += duration
+    if tally.end is None or pts > tally.end:
+        tally.end = pts
+
+
+def _probe(source: Path) -> Mapping[str, object]:
+    try:
+        info = ffmpeg.probe(str(source))
     except FileNotFoundError as exc:
         raise ClipError(
             "ffprobe is not available, so the source duration cannot be read."
@@ -307,17 +467,6 @@ def _streams(info: Mapping[str, object]) -> list[Mapping[str, object]]:
         if isinstance(item, dict):
             streams.append(cast(Mapping[str, object], item))
     return streams
-
-
-def _packets(info: Mapping[str, object]) -> list[Mapping[str, object]]:
-    raw = info.get("packets")
-    if not isinstance(raw, list):
-        return []
-    packets: list[Mapping[str, object]] = []
-    for item in cast(list[object], raw):
-        if isinstance(item, dict):
-            packets.append(cast(Mapping[str, object], item))
-    return packets
 
 
 def _read_duration(item: Mapping[str, object]) -> float | None:
@@ -357,20 +506,6 @@ def _optional_int(raw: object) -> int | None:
         return int(raw, 10)
     except ValueError:
         return None
-
-
-def _last_packet_end(packets: Sequence[Mapping[str, object]]) -> float | None:
-    end: float | None = None
-    for packet in packets:
-        pts = _finite_float(packet.get("pts_time"))
-        if pts is None:
-            continue
-        duration = _finite_float(packet.get("duration_time"))
-        if duration is not None and duration > 0:
-            pts += duration
-        if end is None or pts > end:
-            end = pts
-    return end
 
 
 def _source_has_audio(source: Path) -> bool:
@@ -413,17 +548,6 @@ def _clip_stream(
         output_args["an"] = None
 
     return ffmpeg.output(inp, str(dest), **output_args)
-
-
-def _cut_clip(
-    source: Path,
-    start: float,
-    end: float,
-    dest: Path,
-    *,
-    has_audio: bool,
-) -> None:
-    _run(_clip_stream(source, start, end, dest, has_audio=has_audio), "cut a fragment")
 
 
 def _progress_command(stream: ffmpeg.Stream) -> list[str]:

@@ -33,6 +33,9 @@ app = ["page.html"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+# The shared sample helper lives under tests/. Pytest otherwise puts that
+# directory itself on the path, which hides the tests package.
+pythonpath = ["."]
 
 [tool.pyright]
 pythonVersion = "3.12"

@@ -80,7 +80,7 @@
       </label>
       <label>
         Duration in seconds
-        <input name="duration" type="number" min="0" step="any" required>
+        <input name="duration" type="number" min="0.033" step="any" required>
       </label>
       <label>
         Fragment count
@@ -297,17 +297,6 @@
       const detail = body && body.detail;
       if (typeof detail === "string" && detail.trim()) {
         return detail;
-      }
-      if (Array.isArray(detail)) {
-        const lines = [];
-        for (const item of detail) {
-          if (item && typeof item.msg === "string" && item.msg.trim()) {
-            lines.push(item.msg);
-          }
-        }
-        if (lines.length) {
-          return lines.join(" ");
-        }
       }
       return "The cut could not be made.";
     }

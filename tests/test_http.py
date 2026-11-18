@@ -9,7 +9,6 @@ from __future__ import annotations
 
 import asyncio
 import json
-import subprocess
 import tempfile
 from collections.abc import AsyncIterator, Awaitable, Callable
 from pathlib import Path
@@ -20,6 +19,7 @@ from starlette.types import Message, Scope
 
 from app.errors import ClipError
 from app.main import BODY_OVERHEAD_BYTES, MAX_UPLOAD_BYTES, app
+from tests.sample import video_duration, write_sample
 
 _TOO_LARGE = "File is larger than 100 MB."
 
@@ -28,6 +28,7 @@ def test_page_states_the_limit() -> None:
     status, headers, body = asyncio.run(_call("GET", "/", b""))
     assert status == 200
     assert b"MP4 only, 100 MB maximum" in body
+    assert b'min="0.033"' in body
     assert headers[b"content-type"].startswith(b"text/html")
 
 
@@ -114,7 +115,7 @@ def test_progress_precedes_a_finished_mp4(
     assert tail[4:8] == b"ftyp"
     output = tmp_path / "digest.mp4"
     output.write_bytes(tail)
-    assert _video_duration(output) == pytest.approx(1.0, abs=0.05)
+    assert video_duration(output) == pytest.approx(1.0, abs=0.05)
     assert made
     assert all(not Path(path).exists() for path in made)
 
@@ -177,46 +178,11 @@ def _form(content: bytes, duration: str, fragments: str) -> bytes:
 
 def _source(seconds: float) -> bytes:
     path = Path(tempfile.mkdtemp(prefix="digest-fixture-")) / "source.mp4"
-    subprocess.run(
-        [
-            "ffmpeg",
-            "-y",
-            "-f",
-            "lavfi",
-            "-i",
-            f"testsrc=size=320x240:rate=30:duration={seconds}",
-            "-f",
-            "lavfi",
-            "-i",
-            f"sine=frequency=440:duration={seconds}",
-            "-c:v",
-            "libx264",
-            "-pix_fmt",
-            "yuv420p",
-            "-c:a",
-            "aac",
-            "-shortest",
-            "-movflags",
-            "+faststart",
-            str(path),
-        ],
-        check=True,
-        capture_output=True,
-    )
+    write_sample(path, seconds)
     data = path.read_bytes()
     path.unlink()
     path.parent.rmdir()
     return data
-
-
-def _video_duration(path: Path) -> float:
-    import ffmpeg
-
-    info = ffmpeg.probe(str(path))
-    for stream in info["streams"]:
-        if stream.get("codec_type") == "video":
-            return float(stream["duration"])
-    raise AssertionError("digest has no video stream")
 
 
 async def _call(
