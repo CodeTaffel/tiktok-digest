@@ -37,6 +37,31 @@
       justify-self: start;
       padding: 0.4rem 0.85rem;
     }
+    .hint {
+      color: #78716c;
+      font-size: 0.875rem;
+    }
+    .meter {
+      display: grid;
+      grid-template-columns: 4.5rem 1fr 2.75rem;
+      gap: 0.5rem;
+      align-items: center;
+    }
+    .track {
+      display: block;
+      height: 0.5rem;
+      background: #e7e5e4;
+    }
+    .fill {
+      display: block;
+      height: 100%;
+      width: 0;
+      background: #1c1917;
+    }
+    .pct {
+      text-align: right;
+      font-variant-numeric: tabular-nums;
+    }
     p {
       margin: 0;
       min-height: 1.45em;
@@ -51,6 +76,7 @@
       <label>
         MP4
         <input name="file" type="file" accept=".mp4,video/mp4" required>
+        <span class="hint">MP4 only, 100 MB maximum</span>
       </label>
       <label>
         Duration in seconds
@@ -61,6 +87,20 @@
         <input name="fragments" type="number" min="1" step="1" required>
       </label>
       <button type="submit">Make digest</button>
+      <div class="meter">
+        <span>Upload</span>
+        <span class="track" id="upload-track" role="progressbar" aria-label="Upload" aria-valuemin="0" aria-valuemax="100" aria-valuenow="0">
+          <span id="upload-fill" class="fill"></span>
+        </span>
+        <span id="upload-pct" class="pct"></span>
+      </div>
+      <div class="meter">
+        <span>Cutting</span>
+        <span class="track" id="cut-track" role="progressbar" aria-label="Cutting" aria-valuemin="0" aria-valuemax="100" aria-valuenow="0">
+          <span id="cut-fill" class="fill"></span>
+        </span>
+        <span id="cut-pct" class="pct"></span>
+      </div>
       <p id="error" role="alert"></p>
     </form>
   </main>
@@ -68,7 +108,24 @@
     const form = document.querySelector("#digest");
     const error = document.querySelector("#error");
     const button = form.querySelector("button");
-    const idleLabel = button.textContent;
+    const fileInput = form.querySelector('input[name="file"]');
+    const uploadFill = document.querySelector("#upload-fill");
+    const uploadPct = document.querySelector("#upload-pct");
+    const uploadTrack = document.querySelector("#upload-track");
+    const cutFill = document.querySelector("#cut-fill");
+    const cutPct = document.querySelector("#cut-pct");
+    const cutTrack = document.querySelector("#cut-track");
+    // Same comparison the server uses. Checked here so an oversized file
+    // never becomes a request.
+    const maxBytes = 100 * 1024 * 1024;
+
+    fileInput.addEventListener("change", () => {
+      if (button.disabled) {
+        return;
+      }
+      error.textContent = "";
+      resetBars();
+    });
 
     form.addEventListener("submit", (event) => {
       // Stay on this document. A full navigation would replace the form
@@ -76,33 +133,164 @@
       // in which to show that explanation.
       event.preventDefault();
       error.textContent = "";
-      button.disabled = true;
-      button.textContent = "Working…";
-
-      fetch(form.action, { method: "POST", body: new FormData(form) })
-        .then(async (response) => {
-          if (!response.ok) {
-            error.textContent = await explanation(response);
-            return;
-          }
-          await save(response);
-        })
-        .catch(() => {
-          error.textContent = "The request did not complete.";
-        })
-        .finally(() => {
-          button.disabled = false;
-          button.textContent = idleLabel;
-        });
+      const chosen = fileInput.files && fileInput.files[0];
+      if (!chosen) {
+        return;
+      }
+      if (chosen.size > maxBytes) {
+        error.textContent = "File is larger than 100 MB.";
+        resetBars();
+        return;
+      }
+      send(chosen);
     });
 
-    async function explanation(response) {
+    function send(chosen) {
+      // fetch() does not report how many bytes have left the browser.
+      // The upload events on XMLHttpRequest do, measured against the
+      // file size rather than the multipart wrapper around it.
+      resetBars();
+      setBar(uploadFill, uploadPct, uploadTrack, 0);
+      button.disabled = true;
+      const xhr = new XMLHttpRequest();
+      xhr.open("POST", form.action);
+      // The response is percent lines, then the MP4. x-user-defined maps
+      // each byte to a character we can turn back into that byte.
+      // UTF-8 would replace the bytes that are not text.
+      xhr.overrideMimeType("text/plain; charset=x-user-defined");
+
+      let failed = false;
+      let cursor = 0;
+      let mp4At = -1;
+      let cutting = null;
+
+      xhr.upload.onprogress = (event) => {
+        const percent = uploadPercent(event.loaded, chosen.size);
+        setBar(uploadFill, uploadPct, uploadTrack, percent);
+        if (percent >= 100) {
+          startCutting();
+        }
+      };
+      xhr.upload.onload = () => {
+        setBar(uploadFill, uploadPct, uploadTrack, 100);
+        startCutting();
+      };
+      xhr.onprogress = () => {
+        if (xhr.status && xhr.status !== 200) {
+          return;
+        }
+        readProgress(xhr.responseText);
+      };
+      xhr.onload = () => {
+        if (xhr.status !== 200) {
+          fail(explanationText(xhr.responseText));
+          return;
+        }
+        readProgress(xhr.responseText);
+        if (failed || mp4At < 0) {
+          if (!failed) {
+            fail("The cut could not be made.");
+          }
+          return;
+        }
+        setBar(cutFill, cutPct, cutTrack, 100);
+        const bytes = bytesFromTransport(xhr.responseText.slice(mp4At));
+        saveBlob(new Blob([bytes], { type: "video/mp4" }), filenameFrom(xhr));
+      };
+      xhr.onerror = () => {
+        fail("The request did not complete.");
+      };
+      xhr.onloadend = () => {
+        button.disabled = false;
+      };
+
+      try {
+        xhr.send(new FormData(form));
+      } catch {
+        fail("The request did not complete.");
+        button.disabled = false;
+      }
+
+      function startCutting() {
+        // Upload has stopped at 100%. Cutting stays empty until then, and
+        // a percent that already arrived must not be replaced with zero.
+        if (cutting === null) {
+          cutting = 0;
+          setBar(cutFill, cutPct, cutTrack, 0);
+        }
+      }
+
+      function readProgress(text) {
+        if (failed || mp4At >= 0) {
+          return;
+        }
+        while (cursor < text.length) {
+          const nl = text.indexOf("\n", cursor);
+          if (nl < 0) {
+            return;
+          }
+          const line = text.slice(cursor, nl);
+          cursor = nl + 1;
+          if (line === "OK") {
+            mp4At = cursor;
+            setBar(cutFill, cutPct, cutTrack, 100);
+            cutting = 100;
+            return;
+          }
+          if (line.startsWith("ERR ")) {
+            fail(line.slice(4) || "The cut could not be made.");
+            return;
+          }
+          if (/^\d{1,3}$/.test(line)) {
+            const value = Number(line);
+            if (value >= 0 && value <= 100) {
+              cutting = value;
+              setBar(cutFill, cutPct, cutTrack, value);
+            }
+          }
+        }
+      }
+
+      function fail(message) {
+        failed = true;
+        error.textContent = message;
+        cutting = null;
+        resetBars();
+      }
+    }
+
+    function uploadPercent(sent, size) {
+      if (size <= 0) {
+        return 100;
+      }
+      return Math.min(100, Math.floor((sent / size) * 100));
+    }
+
+    function setBar(fill, label, track, percent) {
+      if (percent === null) {
+        fill.style.width = "0%";
+        label.textContent = "";
+        track.setAttribute("aria-valuenow", "0");
+        return;
+      }
+      const shown = Math.max(0, Math.min(100, Math.round(percent)));
+      fill.style.width = shown + "%";
+      label.textContent = shown + "%";
+      track.setAttribute("aria-valuenow", String(shown));
+    }
+
+    function resetBars() {
+      setBar(uploadFill, uploadPct, uploadTrack, null);
+      setBar(cutFill, cutPct, cutTrack, null);
+    }
+
+    function explanationText(text) {
       // `detail` is the sentence the API already chose. textContent, because
       // that sentence can quote a filename or an ffmpeg line and must not
       // be parsed as markup.
       let body;
       try {
-        body = await response.json();
+        body = JSON.parse(text);
       } catch {
         return "The cut could not be made.";
       }
@@ -124,12 +312,21 @@
       return "The cut could not be made.";
     }
 
-    async function save(response) {
-      const blob = await response.blob();
+    function bytesFromTransport(text) {
+      // x-user-defined stores bytes 0x80-0xFF as U+F780-U+F7FF. The low
+      // eight bits are the original byte either way.
+      const bytes = new Uint8Array(text.length);
+      for (let i = 0; i < text.length; i++) {
+        bytes[i] = text.charCodeAt(i) & 0xff;
+      }
+      return bytes;
+    }
+
+    function saveBlob(blob, name) {
       const url = URL.createObjectURL(blob);
       const link = document.createElement("a");
       link.href = url;
-      link.download = filename(response);
+      link.download = name;
       document.body.append(link);
       link.click();
       link.remove();
@@ -138,8 +335,8 @@
       setTimeout(() => URL.revokeObjectURL(url), 1000);
     }
 
-    function filename(response) {
-      const header = response.headers.get("Content-Disposition") || "";
+    function filenameFrom(xhr) {
+      const header = xhr.getResponseHeader("Content-Disposition") || "";
       const quoted = /filename="([^"]*)"/.exec(header);
       if (quoted && quoted[1]) {
         return quoted[1];

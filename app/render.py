@@ -8,9 +8,11 @@ impossible request inside a shorter file.
 
 from __future__ import annotations
 
+import asyncio
+import contextlib
 import math
 import tempfile
-from collections.abc import Mapping, Sequence
+from collections.abc import AsyncIterator, Mapping, Sequence
 from pathlib import Path
 from typing import cast
 
@@ -88,12 +90,52 @@ def render_digest(
         _reject_short_output(output, checked)
         data = output.read_bytes()
 
-    # A non-zero ffmpeg status is not enough: a truncated mux can still
-    # exit 0 on some builds. An MP4 we are willing to return starts with an
-    # ftyp box; anything else is an error body, not a video.
-    if len(data) < 8 or data[4:8] != b"ftyp":
-        raise ClipError("ffmpeg did not produce a readable MP4.")
+    _require_ftyp(data)
     return data
+
+
+async def iter_cutting_progress(
+    source: Path,
+    intervals: Sequence[tuple[float, float]],
+    dest: Path,
+) -> AsyncIterator[int]:
+    """Yield how much of the requested duration ffmpeg has encoded.
+
+    The number is encoded time over the duration the caller asked for,
+    not wall time. Samples stay at 99 or below. 100 is yielded only after
+    the file at ``dest`` has passed the same length check as a blocking
+    render, because that is the moment the bytes are safe to download.
+    """
+
+    checked = _require_intervals(intervals)
+    has_audio = await asyncio.to_thread(_source_has_audio, source)
+    total = sum(end - start for start, end in checked)
+    finished = 0.0
+    last = -1
+    clips: list[Path] = []
+
+    for index, (start, end) in enumerate(checked):
+        clip = dest.parent / f"clip-{index:04d}.mp4"
+        length = end - start
+        command = _progress_command(
+            _clip_stream(source, start, end, clip, has_audio=has_audio)
+        )
+        async for seconds in _ffmpeg_times(command, "cut a fragment"):
+            percent = _percent_before_done(finished + min(seconds, length), total)
+            if percent != last:
+                last = percent
+                yield percent
+        finished += length
+        percent = _percent_before_done(finished, total)
+        if percent != last:
+            last = percent
+            yield percent
+        clips.append(clip)
+
+    await asyncio.to_thread(_concat, clips, dest)
+    await asyncio.to_thread(_reject_short_output, dest, checked)
+    await asyncio.to_thread(_require_ftyp_file, dest)
+    yield 100
 
 
 def _require_intervals(
@@ -335,14 +377,14 @@ def _source_has_audio(source: Path) -> bool:
     return any(stream.get("codec_type") == "audio" for stream in _streams(_probe(source)))
 
 
-def _cut_clip(
+def _clip_stream(
     source: Path,
     start: float,
     end: float,
     dest: Path,
     *,
     has_audio: bool,
-) -> None:
+) -> ffmpeg.Stream:
     # -ss on the input seeks near the cut, and because we re-encode,
     # ffmpeg's default accurate seek discards the partial GOP before
     # `start`. Output -t then keeps the fragment the length we selected.
@@ -370,8 +412,104 @@ def _cut_clip(
         # and a silent track would make the digest a different recording.
         output_args["an"] = None
 
-    stream = ffmpeg.output(inp, str(dest), **output_args)
-    _run(stream, "cut a fragment")
+    return ffmpeg.output(inp, str(dest), **output_args)
+
+
+def _cut_clip(
+    source: Path,
+    start: float,
+    end: float,
+    dest: Path,
+    *,
+    has_audio: bool,
+) -> None:
+    _run(_clip_stream(source, start, end, dest, has_audio=has_audio), "cut a fragment")
+
+
+def _progress_command(stream: ffmpeg.Stream) -> list[str]:
+    # The extra flags only change how often ffmpeg reports the encoded
+    # timestamp. The default is about a second, which would hide the bar
+    # on a short digest. They are not part of the output graph: the
+    # picture, the audio, and the 9:16 filter stay the blocking command.
+    command = [str(arg) for arg in ffmpeg.compile(stream, overwrite_output=True)]
+    # Global options belong before the inputs. After the output path, ffmpeg
+    # treats a flag as another output and the progress log never appears.
+    return [command[0], "-nostats", "-stats_period", "0.2", "-progress", "pipe:1", *command[1:]]
+
+
+def _percent_before_done(processed: float, total: float) -> int:
+    if total <= 0 or processed <= 0 or not math.isfinite(processed):
+        return 0
+    # Floor, and hold the last point back. A sample on the final frame
+    # would otherwise say 100 before concat and the length check.
+    ratio = min(processed, total) / total
+    return min(99, math.floor(ratio * 100))
+
+
+def _output_seconds(line: str) -> float | None:
+    # out_time_us is the encoded position in microseconds. out_time_ms is
+    # the same unit on current ffmpeg (the name is wrong), so it is not read.
+    text = line.strip()
+    prefix = "out_time_us="
+    if not text.startswith(prefix):
+        return None
+    raw = text[len(prefix) :]
+    if not raw or raw == "N/A":
+        return None
+    try:
+        value = int(raw)
+    except ValueError:
+        return None
+    if value < 0:
+        return None
+    return value / 1_000_000
+
+
+async def _ffmpeg_times(command: list[str], action: str) -> AsyncIterator[float]:
+    """Yield encoded seconds from ffmpeg's progress output.
+
+    stdout is the progress log. stderr is drained beside it: if that pipe
+    fills, ffmpeg stops writing progress and the bar would freeze. The
+    process is killed if the caller stops reading, which is what happens
+    when the browser goes away mid-response.
+    """
+
+    try:
+        process = await asyncio.create_subprocess_exec(
+            *command,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+            stdin=asyncio.subprocess.DEVNULL,
+        )
+    except FileNotFoundError as exc:
+        raise ClipError(
+            "ffmpeg is not available, so the digest cannot be encoded."
+        ) from exc
+
+    assert process.stdout is not None
+    assert process.stderr is not None
+    stderr_task = asyncio.create_task(process.stderr.read())
+    try:
+        while True:
+            raw = await process.stdout.readline()
+            if not raw:
+                break
+            seconds = _output_seconds(raw.decode("utf-8", errors="replace"))
+            if seconds is not None:
+                yield seconds
+        code = await process.wait()
+        err = await stderr_task
+        if code != 0:
+            raise ClipError(_failure(action, err))
+    finally:
+        if process.returncode is None:
+            with contextlib.suppress(ProcessLookupError, OSError):
+                process.kill()
+            await process.wait()
+        if not stderr_task.done():
+            stderr_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await stderr_task
 
 
 def _concat(clips: Sequence[Path], dest: Path) -> None:
@@ -415,10 +553,33 @@ def _run(stream: ffmpeg.Stream, action: str) -> None:
         raise ClipError(_ffmpeg_message(action, exc)) from exc
 
 
+def _require_ftyp(data: bytes) -> None:
+    # A non-zero ffmpeg status is not enough: a truncated mux can still
+    # exit 0 on some builds. An MP4 we are willing to return starts with an
+    # ftyp box; anything else is an error body, not a video.
+    if len(data) < 8 or data[4:8] != b"ftyp":
+        raise ClipError("ffmpeg did not produce a readable MP4.")
+
+
+def _require_ftyp_file(path: Path) -> None:
+    with path.open("rb") as handle:
+        _require_ftyp(handle.read(8))
+
+
 def _ffmpeg_message(action: str, exc: ffmpeg.Error) -> str:
+    return _failure(action, exc.stderr)
+
+
+def _failure(action: str, stderr: bytes | str | None) -> str:
     # The full stderr is a banner plus a progress log. The last non-empty
     # line is the reason ffmpeg stopped, which is the part a client can act on.
-    stderr = exc.stderr
+    line = _last_ffmpeg_line(stderr)
+    if not line:
+        return f"ffmpeg could not {action}."
+    return f"ffmpeg could not {action}: {line}"
+
+
+def _last_ffmpeg_line(stderr: bytes | str | None) -> str:
     text = ""
     if isinstance(stderr, bytes):
         text = stderr.decode("utf-8", errors="replace")
@@ -426,5 +587,5 @@ def _ffmpeg_message(action: str, exc: ffmpeg.Error) -> str:
         text = stderr
     lines = [line.strip() for line in text.splitlines() if line.strip()]
     if not lines:
-        return f"ffmpeg could not {action}."
-    return f"ffmpeg could not {action}: {lines[-1]}"
+        return ""
+    return lines[-1]
