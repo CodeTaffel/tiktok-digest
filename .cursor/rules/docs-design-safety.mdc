@@ -1,0 +1,14 @@
+---
+description: Changelog, docs, simple UX, tests, and secrets
+alwaysApply: true
+---
+
+# Docs, design, tests, safety
+
+- Keep `CHANGELOG.md` in the project root. After every commit, add a date plus a short description of what changed for the user or developer. Group entries by version or date.
+- Record important decisions and limits in an English code comment or a short `DECISIONS.md`.
+- Update the README when how to run the project or its main features change.
+- Early UI stays simple: standard platform components, clear behavior first. No complex animation or visual polish until a later, separate stage.
+- Do not write tests for everything. Test critical paths only: keys, calculations, network calls, and security.
+- Review the diff before committing.
+- Never commit secrets, keys, seed phrases, or configs that contain passwords. Sensitive data goes in environment variables or secure storage.

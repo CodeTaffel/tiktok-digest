@@ -1,0 +1,11 @@
+---
+description: These development rules supplement Cursor rules and do not cancel them
+alwaysApply: true
+---
+
+# These rules supplement Cursor rules
+
+- Cursor user rules, project rules, team rules, and safety rules stay in force.
+- These development rules add to them. They do not replace, cancel, or override a Cursor rule.
+- When both apply, follow both.
+- When they disagree, follow the Cursor rule, and still apply every part of these rules that does not conflict.

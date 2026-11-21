@@ -1,0 +1,18 @@
+---
+description: Atomic steps, confirmation, and one commit per step
+alwaysApply: true
+---
+
+# Workflow
+
+- Split work into the smallest atomic subtasks. One subtask is one small, verifiable step.
+- Before writing code, list those steps briefly.
+- Do only the current step. Do not start the next one until the user accepts the current result.
+- After a step that changes logic, run at least a simple check.
+- Cursor's git rules still decide whether a commit happens. These rules do not cancel that.
+- When a commit is made, it contains one accepted atomic step only. Then add a CHANGELOG entry.
+- Do not mix refactoring and new functionality in the same commit.
+- Commit messages are short and say what changed and why. Examples:
+  - Add basic wallet creation screen with seed display
+  - Fix address validation for integrated addresses
+  - Simplify transaction list rendering and remove unused state

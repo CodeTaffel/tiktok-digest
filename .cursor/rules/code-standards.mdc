@@ -1,0 +1,15 @@
+---
+description: KISS code standards for every project
+alwaysApply: true
+---
+
+# Code
+
+- KISS. Prefer the obvious solution. If you can do without something, do without it.
+- Start with a working minimum, then improve. No premature optimization or extra abstractions.
+- Code must still be clear six months later without a walkthrough.
+- Use clear variable and function names.
+- Comments in English. Explain why, not only what.
+- Add basic error handling in critical places.
+- Do not add a dependency without a real need. Prefer the language and platform standard library.
+- Pin dependency versions.
